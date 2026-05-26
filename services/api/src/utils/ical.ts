@@ -1,54 +1,42 @@
 import { calendarsTable, eventStatesTable, icalFeedSettingsTable } from "@keeper.sh/database/schema";
+import { icsExceptionDatesSchema, icsRecurrenceRuleSchema } from "@keeper.sh/data-schemas";
 import { and, asc, eq, inArray, ne, or, isNull } from "drizzle-orm";
-import type { IcsDateObject, IcsRecurrenceRule } from "ts-ics";
+import { type } from "arktype";
 import { resolveUserIdentifier } from "./user";
 import { database } from "@/context";
 import { formatEventsAsIcal } from "./ical-format";
 import type { CalendarEvent, FeedSettings } from "./ical-format";
 
-const parseJsonField = <TValue>(value: string | null): TValue | null => {
-  if (!value) {
-    return null;
-  }
+const parseStoredJson = (value: string, field: string, eventId: string): unknown => {
   try {
-    return JSON.parse(value) as TValue;
-  } catch {
-    return null;
+    return JSON.parse(value);
+  } catch (error) {
+    throw new Error(`Failed to JSON.parse ${field} for event ${eventId}`, { cause: error });
   }
 };
 
-const reviveDates = (value: unknown): unknown => {
-  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) {
-    return new Date(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => reviveDates(item));
-  }
-  if (value && typeof value === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value)) {
-      result[key] = reviveDates(val);
-    }
-    return result;
-  }
-  return value;
-};
-
-const parseRecurrenceRule = (value: string | null): IcsRecurrenceRule | null => {
-  const parsed = parseJsonField<IcsRecurrenceRule>(value);
-  if (!parsed) {
+const parseRecurrenceRule = (value: string | null, eventId: string) => {
+  if (value === null) {
     return null;
   }
-  // Restore Date instances stripped by JSON.parse — ts-ics requires Date objects on the in-memory shape.
-  return reviveDates(parsed) as IcsRecurrenceRule;
+  const parsed = parseStoredJson(value, "recurrenceRule", eventId);
+  const result = icsRecurrenceRuleSchema(parsed);
+  if (result instanceof type.errors) {
+    throw new TypeError(`Invalid recurrenceRule shape for event ${eventId}: ${result.summary}`);
+  }
+  return result;
 };
 
-const parseExceptionDates = (value: string | null): IcsDateObject[] | null => {
-  const parsed = parseJsonField<IcsDateObject[]>(value);
-  if (!parsed) {
+const parseExceptionDates = (value: string | null, eventId: string) => {
+  if (value === null) {
     return null;
   }
-  return reviveDates(parsed) as IcsDateObject[];
+  const parsed = parseStoredJson(value, "exceptionDates", eventId);
+  const result = icsExceptionDatesSchema(parsed);
+  if (result instanceof type.errors) {
+    throw new TypeError(`Invalid exceptionDates shape for event ${eventId}: ${result.summary}`);
+  }
+  return result;
 };
 
 const DEFAULT_FEED_SETTINGS: FeedSettings = {
@@ -105,6 +93,8 @@ const generateUserCalendar = async (identifier: string): Promise<string | null> 
       isAllDay: eventStatesTable.isAllDay,
       recurrenceRule: eventStatesTable.recurrenceRule,
       exceptionDates: eventStatesTable.exceptionDates,
+      recurrenceId: eventStatesTable.recurrenceId,
+      sourceEventUid: eventStatesTable.sourceEventUid,
       calendarName: calendarsTable.name,
     })
     .from(eventStatesTable)
@@ -126,8 +116,8 @@ const generateUserCalendar = async (identifier: string): Promise<string | null> 
 
   const events: CalendarEvent[] = rows.map((row) => ({
     ...row,
-    recurrenceRule: parseRecurrenceRule(row.recurrenceRule),
-    exceptionDates: parseExceptionDates(row.exceptionDates),
+    recurrenceRule: parseRecurrenceRule(row.recurrenceRule, row.id),
+    exceptionDates: parseExceptionDates(row.exceptionDates, row.id),
   }));
 
   return formatEventsAsIcal(events, settings);
